@@ -16,7 +16,6 @@ pwd                        # Display current directory full path
 ```bash
 cd Desktop/                # Change to Desktop directory
 cd .                       # Stay in current directory (no change)
-cd --                      # WRONG: Invalid syntax, use 'cd -' for previous directory
 cd ..                      # Move to parent directory
 cd ~                       # Move to home directory
 cd -                       # Return to previous directory (toggle between two)
@@ -252,10 +251,7 @@ echo $VAR                  # Display value of VAR variable
 
 **sudo user** - WRONG command
 ```bash
-sudo user                  # INCORRECT: 'user' is not a valid command
-                           # Likely meant: sudo su (switch to root)
-                           # Or: sudo -i (login as root)
-                           # Or: sudo useradd username (create user)
+sudo -i                    # sudo -i (login as root)
 ```
 
 ---
