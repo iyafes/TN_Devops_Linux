@@ -1,5 +1,39 @@
 # PostgreSQL Master-Slave Streaming Replication — Complete Step-by-Step Guide
 
+## Table of Contents
+
+- [Overview](#overview)
+- [What is a PostgreSQL Cluster?](#what-is-a-postgresql-cluster)
+- [What is Streaming Replication?](#what-is-streaming-replication)
+- [Architecture Diagram](#architecture-diagram)
+- [Prerequisites](#prerequisites)
+- [Environment Setup](#environment-setup)
+- [MASTER SERVER Configuration](#master-server-configuration)
+  - [Step 1 — Create Replication User](#step-1--create-replication-user)
+  - [Step 2 — Configure postgresql.conf](#step-2--configure-postgresqlconf)
+  - [Step 3 — Configure pg_hba.conf](#step-3--configure-pg_hbaconf)
+  - [Step 4 — Open Firewall Port](#step-4--open-firewall-port)
+  - [Step 5 — Restart Master PostgreSQL](#step-5--restart-master-postgresql)
+  - [Step 6 — Verify Master Configuration](#step-6--verify-master-configuration)
+- [SLAVE SERVER Configuration](#slave-server-configuration)
+  - [Step 7 — Stop PostgreSQL on Slave](#step-7--stop-postgresql-on-slave)
+  - [Step 8 — Clear Slave Data Directory](#step-8--clear-slave-data-directory)
+  - [Step 9 — Take Base Backup from Master](#step-9--take-base-backup-from-master)
+  - [Step 10 — Verify Backup Files](#step-10--verify-backup-files)
+  - [Step 11 — Start PostgreSQL on Slave](#step-11--start-postgresql-on-slave)
+- [Verify Replication is Working](#verify-replication-is-working)
+  - [Step 12 — Check Slave Connection on Master](#step-12--check-slave-connection-on-master)
+  - [Step 13 — Check Slave is in Standby Mode](#step-13--check-slave-is-in-standby-mode)
+- [Testing Read/Write and Real-Time Sync](#testing-readwrite-and-real-time-sync)
+  - [Step 14 — Write Data on Master](#step-14--write-data-on-master)
+  - [Step 15 — Read Data from Slave](#step-15--read-data-from-slave)
+  - [Step 16 — Prove Slave is Read-Only](#step-16--prove-slave-is-read-only)
+  - [Step 17 — Real-Time Sync Test](#step-17--real-time-sync-test)
+- [How It All Works — Full Flow Summary](#how-it-all-works--full-flow-summary)
+- [Troubleshooting](#troubleshooting)
+
+---
+
 ## Overview
 
 This guide walks through setting up a **PostgreSQL Master-Slave Streaming Replication** cluster across two servers. The goal is:
@@ -49,37 +83,49 @@ In **Streaming Replication**:
 3. Slave **replays** the WAL (applies the same changes to its own data)
 4. Slave stays in sync with Master continuously
 
-```
-Client writes data
-       ↓
-  Master Server
-  (WAL is created)
-       ↓
-  WAL streamed ──────────────────► Slave Server
-                                   (WAL is replayed)
-                                   (Data stays in sync)
+```mermaid
+flowchart LR
+    C([Client])
+
+    subgraph Master["Master Server (VM1)"]
+        MW["WAL Created\n(Write-Ahead Log)"]
+    end
+
+    subgraph Slave["Slave Server (VM2)"]
+        SR["WAL Replayed"]
+        SD["Data Synced"]
+    end
+
+    C -->|Write Query| Master
+    Master -->|WAL Stream - Real Time| Slave
+    SR --> SD
 ```
 
 ---
 
 ## Architecture Diagram
 
-```
-┌─────────────────────────────────┐         ┌──────────────────────────────────┐
-│         MASTER SERVER           │         │          SLAVE SERVER            │
-│         (VM1)                   │         │          (VM2)                   │
-│                                 │         │                                  │
-│  ┌──────────────────────────┐   │         │  ┌───────────────────────────┐   │
-│  │ PostgreSQL Instance      │   │  WAL    │  │ PostgreSQL Instance       │   │
-│  │                          │───┼─Stream──┼─►│ (Standby / Recovery Mode) │   │
-│  │ READ  ✅                 │   │         │  │                           │   │
-│  │ WRITE ✅                 │   │         │  │ READ  ✅                  │   │
-│  │                          │   │         │  │ WRITE ❌ (ERROR)          │   │
-│  └──────────────────────────┘   │         │  └───────────────────────────┘   │
-│                                 │         │                                  │
-│  IP: 172.16.93.132              │         │  IP: 172.16.93.133               │
-│  Port: 5432                     │         │  Port: 5432                      │
-└─────────────────────────────────┘         └──────────────────────────────────┘
+```mermaid
+flowchart TB
+    C([Client])
+
+    subgraph VM1["VM1 — Master Server"]
+        M1["IP: 172.16.93.132 | Port: 5432"]
+        M2["PostgreSQL Instance"]
+        M3["READ ✅ | WRITE ✅"]
+        M1 --- M2 --- M3
+    end
+
+    subgraph VM2["VM2 — Slave Server"]
+        S1["IP: 172.16.93.133 | Port: 5432"]
+        S2["PostgreSQL Instance - Standby Mode"]
+        S3["READ ✅ | WRITE ❌"]
+        S1 --- S2 --- S3
+    end
+
+    C -->|Read + Write| VM1
+    C -->|Read Only| VM2
+    VM1 -->|WAL Streaming - Real Time| VM2
 ```
 
 ---
@@ -115,8 +161,6 @@ ip a
 ```
 
 Look under `ens33` (or similar) for the `inet` value. **Do not use `lo` (127.0.0.1)** — that is the loopback address and only works locally. You need the actual network interface IP.
-
----
 
 ---
 
@@ -277,8 +321,6 @@ Save and exit: `Ctrl+X` → `Y` → `Enter`
 
 This file controls **who can connect to PostgreSQL, from where, and how they authenticate**.
 
-Open the file:
-
 ```bash
 sudo nano /etc/postgresql/16/main/pg_hba.conf
 ```
@@ -334,15 +376,11 @@ Apply all configuration changes by restarting the service:
 sudo systemctl restart postgresql
 ```
 
-> **`systemctl restart postgresql`** — stops and starts the PostgreSQL service, loading all changed configuration files.
-
 Check cluster status:
 
 ```bash
 sudo pg_lsclusters
 ```
-
-> **`pg_lsclusters`** — Ubuntu-specific command that lists all PostgreSQL clusters and their status.
 
 Expected output:
 
@@ -362,44 +400,23 @@ Confirm your settings are active:
 ```bash
 sudo -i -u postgres
 psql -c "SHOW wal_level;"
-```
-
-Expected output:
-```
- wal_level
------------
- replica
-```
-
-```bash
 psql -c "SHOW listen_addresses;"
-```
-
-Expected output:
-```
- listen_addresses
-------------------
- *
-```
-
-```bash
 psql -c "SHOW max_wal_senders;"
 ```
 
-Expected output:
+Expected outputs:
+
 ```
- max_wal_senders
------------------
- 5
+ wal_level       listen_addresses    max_wal_senders
+-----------      ------------------  -----------------
+ replica         *                   5
 ```
 
-All correct? ✅ Master configuration is complete. Exit:
+All correct? ✅ Master configuration is complete.
 
 ```bash
 exit
 ```
-
----
 
 ---
 
@@ -423,17 +440,11 @@ Verify it stopped:
 sudo pg_lsclusters
 ```
 
-Expected:
-```
-Ver  Cluster  Port  Status  Owner
-16   main     5432  down    postgres
-```
+Expected: Status shows `down`.
 
 ---
 
 ## Step 8 — Clear Slave Data Directory
-
-Switch to the postgres user and delete all existing data:
 
 ```bash
 sudo -i -u postgres
@@ -441,7 +452,7 @@ rm -rf /var/lib/postgresql/16/main/*
 ```
 
 > - **`rm -rf`** — forcefully removes files and directories recursively
-> - **`/var/lib/postgresql/16/main/*`** — the `*` deletes everything **inside** the directory but keeps the directory itself
+> - **`*`** — deletes everything **inside** the directory but keeps the directory itself
 >
 > **Why delete?** When PostgreSQL was installed, it created an empty cluster here. We must remove it completely before copying the Master's data. If we don't, the replication setup will conflict with existing files.
 
@@ -463,43 +474,28 @@ Still as the `postgres` user, run:
 pg_basebackup -h 172.16.93.132 -U replicator -D /var/lib/postgresql/16/main/ -P -Xs -R
 ```
 
-> **`pg_basebackup`** — PostgreSQL's built-in tool for creating a binary copy of a running cluster. It is specifically designed for setting up replication standbys.
+> **`pg_basebackup`** — PostgreSQL's built-in tool for creating a binary copy of a running cluster. Specifically designed for setting up replication standbys.
 
 > Each flag explained:
 >
-> | Flag | Value | Meaning |
-> |------|-------|---------|
-> | `-h` | `172.16.93.132` | Connect to this host (Master's IP) |
-> | `-U` | `replicator` | Use this username to connect |
-> | `-D` | `/var/lib/.../main/` | Write the backup to this directory (Slave's data dir) |
-> | `-P` | *(none)* | Show progress percentage during backup |
-> | `-X s` | `s` = stream | Stream WAL files during the backup (so no changes are missed) |
-> | `-R` | *(none)* | **Automatically** create `standby.signal` and write connection info to `postgresql.auto.conf` |
+> | Flag | Meaning |
+> |------|---------|
+> | `-h 172.16.93.132` | Connect to Master's IP |
+> | `-U replicator` | Use this username to connect |
+> | `-D /var/lib/.../main/` | Write the backup to Slave's data directory |
+> | `-P` | Show progress percentage during backup |
+> | `-Xs` | Stream WAL files during the backup so no changes are missed |
+> | `-R` | Auto-create `standby.signal` and write connection info to `postgresql.auto.conf` |
 
-When prompted for a password:
-
-```
-Password:
-```
-
-Type `replica123` and press Enter.
-
-You will see a progress bar:
+When prompted: type `replica123` and press Enter.
 
 ```
 30264/30264 kB (100%), 1/1 tablespace
 ```
 
-When it reaches 100%, the backup is complete ✅
+Backup complete ✅
 
-> **What `-R` does (very important):**
-> Without `-R`, you would have to manually create two things:
-> 1. An empty file called `standby.signal` in the data directory
-> 2. A `primary_conninfo` entry in `postgresql.auto.conf` telling the Slave how to reach the Master
->
-> With `-R`, both are done automatically.
-
-Exit postgres user:
+> **What `-R` does:** Automatically creates `standby.signal` (tells PostgreSQL it is a Slave) and writes `primary_conninfo` to `postgresql.auto.conf` (tells Slave how to reach Master). Without `-R`, both would need to be done manually.
 
 ```bash
 exit
@@ -509,36 +505,20 @@ exit
 
 ## Step 10 — Verify Backup Files
 
-Check that critical replication files were created:
-
 ```bash
 sudo -i -u postgres
-```
-
-Check `standby.signal` exists:
-
-```bash
 ls /var/lib/postgresql/16/main/standby.signal
-```
-
-> **`standby.signal`** — an empty file that tells PostgreSQL "you are a Slave, run in read-only standby mode." PostgreSQL checks for this file at startup. If it exists → Slave mode. If it doesn't exist → normal (Master) mode.
-
-Check connection info was written:
-
-```bash
 cat /var/lib/postgresql/16/main/postgresql.auto.conf
 ```
 
-Expected output:
+Expected output of `cat`:
 
 ```
-# Do not edit this file manually!
 primary_conninfo = 'user=replicator password=replica123 host=172.16.93.132 port=5432 ...'
 ```
 
-> **`primary_conninfo`** — the connection string that tells the Slave where the Master is and how to connect to it for WAL streaming. This is automatically written by `pg_basebackup -R`.
-
-Both files present ✅
+> - **`standby.signal`** — empty file that tells PostgreSQL to run in read-only standby mode
+> - **`primary_conninfo`** — connection string telling the Slave where the Master is
 
 ```bash
 exit
@@ -550,23 +530,10 @@ exit
 
 ```bash
 sudo systemctl start postgresql
-```
-
-Check status:
-
-```bash
 sudo pg_lsclusters
 ```
 
-Expected:
-```
-Ver  Cluster  Port  Status  Owner
-16   main     5432  online  postgres
-```
-
 `online` = Slave is running ✅
-
----
 
 ---
 
@@ -576,14 +543,12 @@ Ver  Cluster  Port  Status  Owner
 
 ## Step 12 — Check Slave Connection on Master
 
-Go back to **VM1 (Master)** and run:
+On **VM1 (Master)**:
 
 ```bash
 sudo -i -u postgres
 psql -c "SELECT * FROM pg_stat_replication;"
 ```
-
-> **`pg_stat_replication`** — a PostgreSQL system view that shows information about all Slave servers currently connected and streaming WAL from this Master.
 
 Expected output:
 
@@ -593,12 +558,8 @@ Expected output:
  1234 | replicator | 172.16.93.133  | streaming | async
 ```
 
-> Key fields:
-> - **`client_addr`** — the Slave's IP address
-> - **`state`** — `streaming` means WAL is actively being sent to the Slave ✅
-> - **`sync_state`** — `async` means asynchronous replication (Master doesn't wait for Slave confirmation)
-
-If this table is empty, see the [Troubleshooting](#troubleshooting) section.
+> - **`state: streaming`** — WAL is actively being sent to the Slave ✅
+> - **`sync_state: async`** — asynchronous replication (Master does not wait for Slave confirmation)
 
 ```bash
 exit
@@ -615,8 +576,6 @@ sudo -i -u postgres
 psql -c "SELECT pg_is_in_recovery();"
 ```
 
-> **`pg_is_in_recovery()`** — a PostgreSQL function that returns `true` if the instance is running in recovery/standby mode (i.e., it is a Slave), and `false` if it is a normal primary (Master).
-
 Expected output:
 
 ```
@@ -625,8 +584,8 @@ Expected output:
  t
 ```
 
-> `t` = `true` = this server is a Slave in standby mode ✅
-> `f` = `false` = something went wrong, this server thinks it is a Master
+> `t` = `true` = Slave is correctly in standby mode ✅
+> `f` = `false` = something went wrong
 
 ```bash
 exit
@@ -634,9 +593,7 @@ exit
 
 ---
 
----
-
-# Testing Read/Write & Real-Time Sync
+# Testing Read/Write and Real-Time Sync
 
 ---
 
@@ -649,46 +606,21 @@ sudo -i -u postgres
 psql
 ```
 
-Create a new database:
-
 ```sql
 CREATE DATABASE testdb;
-```
-
-Connect to it:
-
-```sql
 \c testdb
-```
 
-> **`\c`** — psql command to switch connection to a different database.
-
-Create a table:
-
-```sql
 CREATE TABLE employees (
     id         SERIAL PRIMARY KEY,
     name       VARCHAR(100),
     department VARCHAR(100)
 );
-```
 
-> - **`SERIAL`** — auto-incrementing integer (1, 2, 3...) — no need to insert ID manually
-> - **`PRIMARY KEY`** — uniquely identifies each row
-> - **`VARCHAR(100)`** — variable-length text up to 100 characters
-
-Insert data:
-
-```sql
 INSERT INTO employees (name, department) VALUES
     ('Alice', 'Engineering'),
     ('Bob', 'Marketing'),
     ('Charlie', 'Finance');
-```
 
-Verify the data:
-
-```sql
 SELECT * FROM employees;
 ```
 
@@ -700,7 +632,6 @@ Expected output:
   1 | Alice   | Engineering
   2 | Bob     | Marketing
   3 | Charlie | Finance
-(3 rows)
 ```
 
 Data exists on Master ✅
@@ -709,19 +640,11 @@ Data exists on Master ✅
 
 ## Step 15 — Read Data from Slave
 
-Open **VM2 (Slave)** terminal (keep Master terminal open too):
+On **VM2 (Slave)**, connect locally:
 
 ```bash
 sudo -i -u postgres
-psql -d testdb
-```
-
-> **`-d testdb`** — connect directly to the `testdb` database.
-
-Run the same SELECT query:
-
-```sql
-SELECT * FROM employees;
+psql -d testdb -c "SELECT * FROM employees;"
 ```
 
 Expected output:
@@ -732,70 +655,59 @@ Expected output:
   1 | Alice   | Engineering
   2 | Bob     | Marketing
   3 | Charlie | Finance
-(3 rows)
 ```
 
-> **The data written on Master is readable on Slave!** ✅
-> This confirms WAL streaming replication is working. The Slave received and replayed the WAL from Master, resulting in identical data.
+> **The data written on Master is readable on Slave!** ✅ WAL streaming replication is confirmed working.
 
 ---
 
 ## Step 16 — Prove Slave is Read-Only
 
-Still on **VM2 (Slave)**, try to write data:
+On **VM2 (Slave)**:
+
+```bash
+sudo -i -u postgres
+psql -d testdb
+```
 
 ```sql
 INSERT INTO employees (name, department) VALUES ('Hacker', 'Unknown');
 ```
 
-Expected output:
+Expected:
 
 ```
 ERROR:  cannot execute INSERT in a read-only transaction
 ```
 
-> This error proves the Slave is correctly operating in **read-only mode**. The `standby.signal` file and WAL recovery mode prevent any write operations. This is the expected and correct behavior for a replication Slave.
-
-Try UPDATE and DELETE — they also fail:
-
-```sql
-UPDATE employees SET name = 'X' WHERE id = 1;
--- ERROR: cannot execute UPDATE in a read-only transaction
-
-DELETE FROM employees WHERE id = 1;
--- ERROR: cannot execute DELETE in a read-only transaction
-```
-
-Slave is truly read-only ✅
+> This error proves the Slave is correctly in **read-only mode**. The `standby.signal` file and WAL recovery mode prevent any write operations. ✅
 
 ---
 
 ## Step 17 — Real-Time Sync Test
 
-This test shows replication happening **live** as you type.
+Open **two terminals side by side** — one for Master (VM1), one for Slave (VM2).
 
-Open **two terminals side by side** — one for Master, one for Slave.
-
-**On Slave terminal** — run this query and note only 3 rows exist:
+**Slave terminal** — check current rows:
 
 ```sql
 SELECT * FROM employees;
--- Shows 3 rows: Alice, Bob, Charlie
+-- Shows: Alice, Bob, Charlie (3 rows)
 ```
 
-**On Master terminal** — insert a new row:
+**Master terminal** — insert a new row:
 
 ```sql
 INSERT INTO employees (name, department) VALUES ('David', 'HR');
 ```
 
-**On Slave terminal** — immediately run the SELECT again:
+**Slave terminal** — run SELECT again immediately:
 
 ```sql
 SELECT * FROM employees;
 ```
 
-Expected output:
+Expected:
 
 ```
  id |  name   | department
@@ -806,41 +718,98 @@ Expected output:
   4 | David   | HR
 ```
 
-> **David appeared on Slave almost instantly!** ✅ This is real-time WAL streaming replication in action. The moment Master commits the INSERT, the WAL record is streamed to Slave and replayed.
-
----
+> **David appeared on Slave almost instantly!** ✅ Real-time WAL streaming replication confirmed.
 
 ---
 
 # How It All Works — Full Flow Summary
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                                                                         │
-│  1. Client sends INSERT to Master                                       │
-│                   ↓                                                     │
-│  2. Master writes change to WAL buffer (RAM)                           │
-│                   ↓                                                     │
-│  3. WAL is flushed to disk (pg_wal/ directory)                         │
-│                   ↓                                                     │
-│  4. WAL Sender process streams WAL record to Slave ──────────────────► │
-│                                                                         │
-│                                              ┌────────────────────────┐│
-│                                              │ 5. WAL Receiver gets   ││
-│                                              │    the WAL record      ││
-│                                              │         ↓              ││
-│                                              │ 6. WAL is replayed     ││
-│                                              │    (same INSERT runs)  ││
-│                                              │         ↓              ││
-│                                              │ 7. Slave data is now   ││
-│                                              │    identical to Master ││
-│                                              └────────────────────────┘│
-│                                                                         │
-│  8. Client SELECT on Slave → sees the new data ✅                      │
-│  9. Client INSERT on Slave → ERROR: read-only ❌                       │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant M as Master (VM1)
+    participant W as WAL Log (pg_wal/)
+    participant S as Slave (VM2)
+
+    C->>M: INSERT INTO employees VALUES ('David', 'HR')
+    M->>W: Write change to WAL buffer (RAM)
+    W->>W: Flush WAL to disk
+    W-->>S: Stream WAL record in real time
+    S->>S: WAL Receiver gets the record
+    S->>S: WAL Replayed — same INSERT runs on Slave
+    Note over S: Slave data is now identical to Master
+
+    C->>S: SELECT * FROM employees
+    S-->>C: Returns all rows including David ✅
+
+    C->>S: INSERT INTO employees VALUES ('X', 'Y')
+    S-->>C: ERROR — cannot execute INSERT in read-only transaction ❌
 ```
 
 ---
 
+# Troubleshooting
+
+### `pg_stat_replication` is empty (no rows)
+
+The Slave is not connecting to Master. On Slave, check the logs:
+
+```bash
+sudo tail -30 /var/log/postgresql/postgresql-16-main.log
+```
+
+| Problem | Fix |
+|---------|-----|
+| Wrong Master IP in backup | Re-run `pg_basebackup` with correct IP |
+| Firewall blocking port 5432 | Run `sudo ufw allow 5432/tcp` on Master |
+| Wrong IP in `pg_hba.conf` | Edit `pg_hba.conf` on Master with correct Slave IP |
+| Password wrong | Check `postgresql.auto.conf` on Slave for correct password |
+
+---
+
+### Slave shows `pg_is_in_recovery() = f`
+
+`standby.signal` file may be missing. Check:
+
+```bash
+ls /var/lib/postgresql/16/main/standby.signal
+```
+
+If missing, create it manually:
+
+```bash
+sudo -i -u postgres
+touch /var/lib/postgresql/16/main/standby.signal
+sudo systemctl restart postgresql
+```
+
+---
+
+### `pg_basebackup` fails with "Connection refused"
+
+1. Confirm `listen_addresses = '*'` in Master's `postgresql.conf`
+2. Confirm Slave IP is in Master's `pg_hba.conf`
+3. Confirm PostgreSQL was restarted after config changes
+4. Confirm port is open: `sudo ufw allow 5432/tcp`
+
+Test connectivity from Slave to Master:
+
+```bash
+psql -h 172.16.93.132 -U replicator -d postgres
+```
+
+---
+
+### `active (exited)` in systemctl status
+
+This is **normal on Ubuntu**. Check actual cluster status:
+
+```bash
+sudo pg_lsclusters
+```
+
+If it shows `online`, PostgreSQL is running correctly.
+
+---
+
+*Guide covers PostgreSQL 16 on Ubuntu Server with VMware. Adjust version numbers in paths as needed for your installation.*
