@@ -16,6 +16,7 @@
 9. [Monitoring and Troubleshooting](#monitoring-and-troubleshooting)
 10. [Backup and Restore](#backup-and-restore)
 11. [Quick Reference](#quick-reference)
+12. [Optional — Cluster Node Management](#optional--cluster-node-management)
 
 ---
 
@@ -1483,6 +1484,308 @@ psql -h 172.16.93.139 -p 5001 -U postgres
 | Receive LSN | How much WAL the Replica has received from the Primary |
 | Replay LSN | How much WAL the Replica has applied to its database |
 | Lag | How far behind the Replica is (0 = fully in sync) |
+
+---
+
+## Optional — Cluster Node Management
+
+---
+
+### Adding a New Node to Existing Cluster
+
+This procedure adds a new node (e.g., pnode4 at `172.16.93.142`) to a running 3-node cluster without any downtime.
+
+**High Level Flow:**
+```
+1. /etc/hosts update on all nodes
+2. Firewall setup on new node
+3. etcd cluster: register new member first, then start etcd on new node
+4. PostgreSQL install on new node (no initdb)
+5. Patroni install + config — Patroni will auto-clone from Primary
+6. HAProxy config update
+```
+
+#### Step 1 — /etc/hosts Update
+
+**On existing nodes (pnode1, pnode2, pnode3, haproxy):**
+```bash
+echo "172.16.93.142 pnode4" | sudo tee -a /etc/hosts
+```
+
+**On pnode4:**
+```bash
+sudo tee -a /etc/hosts <<EOF
+172.16.93.136 pnode1
+172.16.93.137 pnode2
+172.16.93.138 pnode3
+172.16.93.139 haproxy
+172.16.93.142 pnode4
+EOF
+```
+
+#### Step 2 — Firewall on pnode4
+
+```bash
+sudo firewall-cmd --permanent --add-port=2379/tcp
+sudo firewall-cmd --permanent --add-port=2380/tcp
+sudo firewall-cmd --permanent --add-port=5432/tcp
+sudo firewall-cmd --permanent --add-port=8008/tcp
+sudo firewall-cmd --reload
+```
+
+#### Step 3 — etcd: Register New Member First
+
+**From any existing node:**
+```bash
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.137:2379,http://172.16.93.138:2379 \
+  member add etcd4 \
+  --peer-urls=http://172.16.93.142:2380
+```
+
+> ⚠️ Must do this BEFORE starting etcd on pnode4. etcd uses Raft consensus — existing cluster must approve new member first.
+
+**On pnode4 — install etcd:**
+```bash
+ETCD_VER=v3.5.17
+cd /tmp
+sudo curl -L https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz -o etcd.tar.gz
+tar xzvf etcd.tar.gz
+sudo mv /tmp/etcd-${ETCD_VER}-linux-amd64/etcd /usr/local/bin/
+sudo mv /tmp/etcd-${ETCD_VER}-linux-amd64/etcdctl /usr/local/bin/
+sudo restorecon -v /usr/local/bin/etcd /usr/local/bin/etcdctl
+sudo useradd -r -s /sbin/nologin etcd
+sudo mkdir -p /etcd/data /etc/etcd
+sudo chown etcd:etcd /etcd/data
+sudo chmod 700 /etcd/data
+```
+
+**On pnode4 — etcd config:**
+```bash
+sudo tee /etc/etcd/etcd.conf <<EOF
+ETCD_NAME="etcd4"
+ETCD_DATA_DIR="/etcd/data"
+ETCD_LISTEN_PEER_URLS="http://172.16.93.142:2380"
+ETCD_LISTEN_CLIENT_URLS="http://172.16.93.142:2379,http://127.0.0.1:2379"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="http://172.16.93.142:2380"
+ETCD_ADVERTISE_CLIENT_URLS="http://172.16.93.142:2379"
+ETCD_INITIAL_CLUSTER="etcd1=http://172.16.93.136:2380,etcd2=http://172.16.93.137:2380,etcd3=http://172.16.93.138:2380,etcd4=http://172.16.93.142:2380"
+ETCD_INITIAL_CLUSTER_STATE="existing"
+ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster-1"
+ETCD_QUOTA_BACKEND_BYTES=8589934592
+ETCD_AUTO_COMPACTION_MODE=revision
+ETCD_AUTO_COMPACTION_RETENTION=1000
+EOF
+```
+
+> Key difference from original setup: `ETCD_INITIAL_CLUSTER_STATE="existing"` instead of `"new"`, and all 4 nodes listed in `ETCD_INITIAL_CLUSTER`.
+
+**On pnode4 — start etcd:**
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable etcd
+sudo systemctl start etcd
+```
+
+**Verify — all 4 members started:**
+```bash
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.137:2379,http://172.16.93.138:2379,http://172.16.93.142:2379 \
+  member list
+```
+
+#### Step 4 — PostgreSQL Install on pnode4
+
+```bash
+sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+sudo dnf -qy module disable postgresql
+sudo dnf install -y postgresql16-server postgresql16-contrib
+sudo passwd postgres   # use same password as other nodes
+sudo mkdir -p /data/patroni
+sudo chown postgres:postgres /data/patroni
+sudo chmod 700 /data/patroni
+```
+
+> ⚠️ Do NOT run `initdb` or start `postgresql-16`. Patroni will clone from Primary automatically.
+
+#### Step 5 — Patroni Install + Config on pnode4
+
+```bash
+sudo dnf install -y python3-pip python3-devel gcc
+sudo pip3 install patroni[etcd] psycopg2-binary
+sudo mkdir -p /etc/patroni
+sudo chown postgres:postgres /etc/patroni
+```
+
+```bash
+sudo -u postgres tee /etc/patroni/patroni.yml <<EOF
+scope: postgres-cluster
+namespace: /service/
+name: pnode4
+
+restapi:
+  listen: 172.16.93.142:8008
+  connect_address: 172.16.93.142:8008
+
+etcd3:
+  hosts:
+    - 172.16.93.136:2379
+    - 172.16.93.137:2379
+    - 172.16.93.138:2379
+    - 172.16.93.142:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_log_hints: "on"
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+  pg_hba:
+    - host replication replicator 127.0.0.1/32 md5
+    - host replication replicator 172.16.93.0/24 md5
+    - host all all 0.0.0.0/0 md5
+
+  users:
+    admin:
+      password: admin123
+      options:
+        - createrole
+        - createdb
+    replicator:
+      password: replicator123
+      options:
+        - replication
+
+postgresql:
+  listen: 172.16.93.142:5432
+  connect_address: 172.16.93.142:5432
+  data_dir: /data/patroni
+  bin_dir: /usr/pgsql-16/bin
+  pgpass: /tmp/pgpass
+  authentication:
+    replication:
+      username: replicator
+      password: replicator123
+    superuser:
+      username: postgres
+      password: postgres123
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false
+EOF
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable patroni
+sudo systemctl start patroni
+sudo journalctl -u patroni -f   # watch clone progress
+```
+
+#### Step 6 — HAProxy Config Update
+
+Add pnode4 to both `primary` and `replica` sections in `/etc/haproxy/haproxy.cfg`:
+```
+server pnode4 172.16.93.142:5432 maxconn 100 check port 8008
+```
+
+```bash
+sudo systemctl reload haproxy
+```
+
+#### Verify New Node Added Successfully
+
+```bash
+patronictl -c /etc/patroni/patroni.yml list
+psql -h 172.16.93.136 -U postgres -c "SELECT slot_name, active FROM pg_replication_slots;"
+psql -h 172.16.93.142 -U postgres -c "SELECT pg_is_in_recovery();"  # should return t
+```
+
+---
+
+### Removing a Node from Existing Cluster
+
+This procedure safely removes a node (e.g., pnode2) from a running cluster.
+
+**Before removing — check if target node is Primary:**
+```bash
+patronictl -c /etc/patroni/patroni.yml list
+```
+
+If the target node is **Leader**, switchover first:
+```bash
+patronictl -c /etc/patroni/patroni.yml switchover postgres-cluster \
+  --master pnode2 --candidate pnode1 --scheduled now
+```
+
+#### Step 1 — Stop Patroni on Target Node
+
+**On pnode2:**
+```bash
+sudo systemctl stop patroni
+sudo systemctl disable patroni
+```
+
+**Verify from any node:**
+```bash
+patronictl -c /etc/patroni/patroni.yml list
+```
+
+#### Step 2 — Remove from etcd Cluster
+
+**From any other node — get member ID first:**
+```bash
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.137:2379,http://172.16.93.138:2379 \
+  member list
+```
+
+**Remove using the ID:**
+```bash
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.137:2379,http://172.16.93.138:2379 \
+  member remove <pnode2_member_id>
+```
+
+> Must remove from a different node — removing your own node mid-command can cause incomplete execution.
+
+#### Step 3 — HAProxy Config Update
+
+Remove pnode2 lines from both `primary` and `replica` sections:
+```bash
+sudo systemctl reload haproxy
+```
+
+#### Step 4 — Replication Slot Cleanup
+
+Inactive slots cause Primary to retain WAL indefinitely — disk fills up over time.
+
+```bash
+psql -h 172.16.93.136 -U postgres -c "SELECT slot_name, active FROM pg_replication_slots;"
+psql -h 172.16.93.136 -U postgres -c "SELECT pg_drop_replication_slot('pnode2');"
+```
+
+#### Step 5 — Verify
+
+```bash
+patronictl -c /etc/patroni/patroni.yml list
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.137:2379,http://172.16.93.138:2379 \
+  member list
+psql -h 172.16.93.136 -U postgres -c "SELECT slot_name, active FROM pg_replication_slots;"
+```
 
 ---
 
