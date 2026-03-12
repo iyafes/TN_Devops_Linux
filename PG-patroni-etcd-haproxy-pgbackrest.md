@@ -17,6 +17,7 @@
 10. [Backup and Restore](#backup-and-restore)
 11. [Quick Reference](#quick-reference)
 12. [Optional — Cluster Node Management](#optional--cluster-node-management)
+13. [Optional — pgBackRest Backup System](#optional--pgbackrest-backup-system)
 
 ---
 
@@ -1789,4 +1790,500 @@ psql -h 172.16.93.136 -U postgres -c "SELECT slot_name, active FROM pg_replicati
 
 ---
 
-*Guide prepared for: Rocky Linux 9 | PostgreSQL 16 | Patroni 4.x | etcd 3.5.x | HAProxy 2.8.x*
+### Re-adding a Previously Removed Node
+
+This procedure re-adds a node that was cleanly removed from the cluster (e.g., pnode2 at `172.16.93.137`). Since the node still has all software installed and configured, it is much simpler than adding a brand new node.
+
+**Key difference from adding a new node:** etcd, PostgreSQL, and Patroni are already installed. The main steps are: rejoin etcd, clean the stale data directory, and restart Patroni — it will auto-clone from the current Primary.
+
+> ⚠️ **Before re-adding:** verify the node's `/etc/hosts` still has all cluster members, and all other nodes still have this node's entry. If not, fix `/etc/hosts` first.
+
+**High Level Flow:**
+```
+1. Verify /etc/hosts on all nodes
+2. Register etcd member first (from another node)
+3. Update etcd config on the target node (INITIAL_CLUSTER_STATE → "existing")
+4. Start etcd on target node
+5. Clean data directory + start Patroni → auto-clone happens
+6. Update HAProxy config
+7. Drop old replication slot if it still exists
+```
+
+#### Step 1 — Verify /etc/hosts
+
+**On pnode2 — check that all nodes are listed:**
+```bash
+cat /etc/hosts
+# Should include: pnode1, pnode3, pnode4 (or whichever are active), haproxy
+```
+
+**On existing nodes — check that pnode2 is still listed:**
+```bash
+grep pnode2 /etc/hosts  # should return: 172.16.93.137 pnode2
+```
+
+If missing on any node, add it:
+```bash
+echo "172.16.93.137 pnode2" | sudo tee -a /etc/hosts
+```
+
+#### Step 2 — Register etcd Member (from any existing node)
+
+```bash
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.138:2379,http://172.16.93.142:2379 \
+  member add etcd2 \
+  --peer-urls=http://172.16.93.137:2380
+```
+
+> ⚠️ Must do this BEFORE starting etcd on pnode2. If you start etcd first without registering, it will fail with a cluster ID mismatch error.
+
+**Verify the member was added (still unstarted):**
+```bash
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.138:2379,http://172.16.93.142:2379 \
+  member list
+# pnode2/etcd2 should appear as "unstarted"
+```
+
+#### Step 3 — Update etcd Config on pnode2
+
+The etcd config needs two changes:
+- `ETCD_INITIAL_CLUSTER_STATE` must be `"existing"` (not `"new"`)
+- `ETCD_INITIAL_CLUSTER` must list all current members
+
+```bash
+sudo tee /etc/etcd/etcd.conf <<EOF
+ETCD_NAME="etcd2"
+ETCD_DATA_DIR="/etcd/data"
+ETCD_LISTEN_PEER_URLS="http://172.16.93.137:2380"
+ETCD_LISTEN_CLIENT_URLS="http://172.16.93.137:2379,http://127.0.0.1:2379"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="http://172.16.93.137:2380"
+ETCD_ADVERTISE_CLIENT_URLS="http://172.16.93.137:2379"
+ETCD_INITIAL_CLUSTER="etcd1=http://172.16.93.136:2380,etcd2=http://172.16.93.137:2380,etcd3=http://172.16.93.138:2380,etcd4=http://172.16.93.142:2380"
+ETCD_INITIAL_CLUSTER_STATE="existing"
+ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster-1"
+ETCD_QUOTA_BACKEND_BYTES=8589934592
+ETCD_AUTO_COMPACTION_MODE=revision
+ETCD_AUTO_COMPACTION_RETENTION=1000
+EOF
+```
+
+> **Why `ETCD_INITIAL_CLUSTER_STATE="existing"`?** When state is `"new"`, etcd tries to bootstrap a fresh cluster — it will conflict with the running cluster. `"existing"` tells etcd this node is joining a cluster that already exists.
+
+#### Step 4 — Clean Old etcd Data and Start
+
+The old etcd data directory must be cleared — it contains state from the previous cluster membership that is now stale.
+
+```bash
+# Clear stale etcd data
+sudo rm -rf /etcd/data/*
+
+# Start etcd
+sudo systemctl start etcd
+sudo journalctl -u etcd -f   # watch for "added member" and "synced" messages
+```
+
+**Verify from any node:**
+```bash
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.137:2379,http://172.16.93.138:2379,http://172.16.93.142:2379 \
+  member list
+# All members should show as "started"
+```
+
+#### Step 5 — Clean PostgreSQL Data and Start Patroni
+
+Patroni will detect it needs to clone from the Primary and will do so automatically.
+
+```bash
+# On pnode2 — clear stale PostgreSQL data
+sudo bash -c "rm -rf /data/patroni/*"
+
+# Start Patroni
+sudo systemctl start patroni
+sudo journalctl -u patroni -f   # watch for clone progress
+```
+
+Expected log output during clone:
+```
+INFO: establishing a new patroni connection to the postgres cluster
+INFO: cloning from 'pnode3' with pg_basebackup
+INFO: clone complete
+INFO: starting as a secondary
+```
+
+**Verify from any node:**
+```bash
+patronictl -c /etc/patroni/patroni.yml list
+```
+
+pnode2 should appear as `Replica` with `Lag=0` once streaming catches up.
+
+#### Step 6 — Update HAProxy Config
+
+Re-add pnode2 to both `listen primary` and `listen replica` sections in `/etc/haproxy/haproxy.cfg`:
+
+```
+server pnode2 172.16.93.137:5432 maxconn 100 check port 8008
+```
+
+```bash
+sudo systemctl reload haproxy
+```
+
+#### Step 7 — Check Replication Slots
+
+If a slot for pnode2 already exists (left from before removal), Patroni will reuse it. If no slot exists, Patroni creates one automatically.
+
+```bash
+psql -h 172.16.93.136 -U postgres -c "SELECT slot_name, active FROM pg_replication_slots;"
+```
+
+If pnode2's slot is present and `active=t`, everything is healthy. If it's `active=f`, it may be a leftover from before — Patroni should activate it automatically once streaming begins.
+
+---
+
+## Optional — pgBackRest Backup System
+
+pgBackRest is a dedicated backup and restore tool for PostgreSQL. It provides full, differential, and incremental backups, WAL archiving, PITR (Point-in-Time Recovery), and parallel restore — all integrated into one tool.
+
+### Architecture
+
+In this setup:
+- **haproxy node** (`172.16.93.139`) acts as the **repository host** — stores all backup files and WAL archives
+- **db nodes** (pnode1, pnode3, pnode4) push WAL and trigger backups — they communicate with haproxy over SSH
+
+```
+pnode1 ──┐
+pnode3 ──┼──── SSH ────► haproxy (/var/lib/pgbackrest)
+pnode4 ──┘
+           WAL + backups stored here
+```
+
+> **Why haproxy as repository host?** In this lab, haproxy is the only node that doesn't run PostgreSQL, so it's the natural choice for off-database backup storage. In production, a dedicated backup server is preferred.
+
+### Step 1 — Install pgBackRest on All Nodes
+
+**On db nodes (pnode1, pnode3, pnode4):**
+```bash
+sudo dnf install -y epel-release
+sudo dnf install -y pgbackrest
+```
+
+**On haproxy node:**
+```bash
+# pgBackRest is not in EPEL for haproxy (no PostgreSQL repo), install via PGDG repo
+sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+sudo dnf install -y epel-release libssh2
+sudo dnf install -y pgbackrest
+```
+
+> ⚠️ **Common pitfall:** If pgBackRest was installed on haproxy BEFORE creating `/etc/pgbackrest/`, the config directory may not exist. Create it manually:
+> ```bash
+> sudo mkdir -p /etc/pgbackrest
+> ```
+
+### Step 2 — SSH Key Exchange
+
+pgBackRest transfers files between nodes over SSH. The `postgres` user on db nodes must be able to SSH to haproxy as `haproxy` user, and vice versa.
+
+**On each db node (pnode1, pnode3, pnode4) — as postgres user:**
+```bash
+# Generate SSH key for postgres user (if not already exists)
+sudo -u postgres ssh-keygen -t rsa -b 4096 -N "" -f /home/postgres/.ssh/id_rsa
+
+# Copy public key to haproxy node
+sudo -u postgres ssh-copy-id haproxy@172.16.93.139
+```
+
+**On haproxy node — as haproxy user:**
+```bash
+# Generate SSH key for haproxy user
+sudo -u haproxy ssh-keygen -t rsa -b 4096 -N "" -f /home/haproxy/.ssh/id_rsa
+
+# Copy public key to each db node
+sudo -u haproxy ssh-copy-id postgres@172.16.93.136  # pnode1
+sudo -u haproxy ssh-copy-id postgres@172.16.93.138  # pnode3
+sudo -u haproxy ssh-copy-id postgres@172.16.93.142  # pnode4
+```
+
+**Verify SSH works without password:**
+```bash
+# From haproxy node
+sudo -u haproxy ssh postgres@172.16.93.136 "echo SSH OK"
+sudo -u haproxy ssh postgres@172.16.93.138 "echo SSH OK"
+sudo -u haproxy ssh postgres@172.16.93.142 "echo SSH OK"
+
+# From pnode1
+sudo -u postgres ssh haproxy@172.16.93.139 "echo SSH OK"
+```
+
+### Step 3 — Create Repository Directory (haproxy node)
+
+```bash
+sudo mkdir -p /var/lib/pgbackrest
+sudo chown haproxy:haproxy /var/lib/pgbackrest
+sudo chmod 750 /var/lib/pgbackrest
+```
+
+### Step 4 — Write Config Files
+
+**On haproxy node** (`/etc/pgbackrest/pgbackrest.conf`):
+
+This node is the repository host — it knows where all db nodes are.
+
+```ini
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=2
+repo1-retention-diff=7
+log-level-console=info
+log-level-file=detail
+log-path=/var/log/pgbackrest
+start-fast=y
+
+[postgres-cluster]
+pg1-host=172.16.93.136
+pg1-host-user=postgres
+pg1-path=/data/patroni
+pg1-port=5432
+pg3-host=172.16.93.138
+pg3-host-user=postgres
+pg3-path=/data/patroni
+pg3-port=5432
+pg4-host=172.16.93.142
+pg4-host-user=postgres
+pg4-path=/data/patroni
+pg4-port=5432
+```
+
+> **Retention explained:**
+> - `repo1-retention-full=2` — keep the 2 most recent full backups; oldest expires on next full
+> - `repo1-retention-diff=7` — keep up to 7 differential backups
+
+**On db nodes** (`/etc/pgbackrest/pgbackrest.conf`) — same config on pnode1, pnode3, pnode4:
+
+These nodes only need to know where the repository is.
+
+```ini
+[global]
+repo1-host=172.16.93.139
+repo1-host-user=haproxy
+repo1-path=/var/lib/pgbackrest
+log-level-console=info
+log-level-file=detail
+log-path=/var/log/pgbackrest
+start-fast=y
+
+[postgres-cluster]
+pg1-path=/data/patroni
+pg1-port=5432
+```
+
+### Step 5 — Create Log Directories
+
+**On db nodes (pnode1, pnode3, pnode4):**
+```bash
+sudo mkdir -p /var/log/pgbackrest
+sudo chown postgres:postgres /var/log/pgbackrest
+```
+
+**On haproxy node:**
+```bash
+sudo mkdir -p /var/log/pgbackrest
+sudo chown haproxy:haproxy /var/log/pgbackrest
+```
+
+### Step 6 — Create Stanza
+
+A "stanza" is pgBackRest's name for a PostgreSQL cluster configuration. This command creates the archive directory structure on haproxy and verifies connectivity to all db nodes.
+
+```bash
+# Run on haproxy node
+sudo -u haproxy pgbackrest --stanza=postgres-cluster stanza-create
+```
+
+Expected output:
+```
+INFO: stanza-create command begin
+INFO: stanza-create for stanza 'postgres-cluster' on repo1
+INFO: stanza-create command end: completed successfully
+```
+
+### Step 7 — Enable WAL Archiving via Patroni
+
+WAL archiving must be configured through `patronictl edit-config` so Patroni applies it cluster-wide and restarts PostgreSQL correctly.
+
+```bash
+patronictl -c /etc/patroni/patroni.yml edit-config
+```
+
+Add the following under `postgresql:` → `parameters:` and add `recovery_conf:`:
+
+```yaml
+postgresql:
+  parameters:
+    archive_mode: 'on'
+    archive_command: 'pgbackrest --stanza=postgres-cluster archive-push %p'
+    archive_timeout: 300
+  recovery_conf:
+    restore_command: 'pgbackrest --stanza=postgres-cluster archive-get %f %p'
+```
+
+Save and exit. Patroni will detect the change and prompt for restart:
+
+```bash
+patronictl -c /etc/patroni/patroni.yml restart postgres-cluster
+```
+
+> ⚠️ `archive_mode` requires a PostgreSQL restart — `reload` is not enough. Always use `patronictl restart` to let Patroni manage the restart safely.
+
+**Verify archiving is active:**
+```bash
+psql -h 172.16.93.136 -U postgres -c "SHOW archive_mode;"
+psql -h 172.16.93.136 -U postgres -c "SHOW archive_command;"
+```
+
+### Step 8 — Verify Everything with Check
+
+```bash
+# Run on haproxy node
+sudo -u haproxy pgbackrest --stanza=postgres-cluster check
+```
+
+This verifies: SSH connections, archive_mode is on, WAL push works end-to-end. If successful:
+```
+INFO: check command begin
+INFO: WAL segment 000000... successfully archived
+INFO: check command end: completed successfully
+```
+
+### Step 9 — Take Backups
+
+```bash
+# Full backup (haproxy node)
+sudo -u haproxy pgbackrest --stanza=postgres-cluster --type=full backup
+
+# Differential backup (changes since last full)
+sudo -u haproxy pgbackrest --stanza=postgres-cluster --type=diff backup
+
+# Incremental backup (changes since last any backup)
+sudo -u haproxy pgbackrest --stanza=postgres-cluster --type=incr backup
+
+# View backup list and info
+sudo -u haproxy pgbackrest --stanza=postgres-cluster info
+```
+
+**Backup types explained:**
+| Type | Based on | Size | Use case |
+|------|----------|------|----------|
+| `full` | Nothing (complete copy) | Largest | Weekly/daily baseline |
+| `diff` | Last full | Medium | Daily |
+| `incr` | Last any backup | Smallest | Hourly or frequent |
+
+### Step 10 — Restore Practice
+
+#### Normal Restore (latest backup)
+
+This simulates a disaster on a db node. Patroni must be stopped first.
+
+```bash
+# On the node to restore (e.g., pnode1)
+sudo systemctl stop patroni
+
+# Clear data directory
+sudo bash -c "rm -rf /data/patroni/*"
+
+# Restore from latest backup
+sudo -u postgres pgbackrest --stanza=postgres-cluster restore
+
+# Start Patroni — it will detect restored data and join cluster
+sudo systemctl start patroni
+sudo journalctl -u patroni -f
+```
+
+After restore, if pnode1 comes up as Replica and streams from the current Leader — restore was successful.
+
+#### PITR — Point-in-Time Recovery
+
+PITR lets you restore the database to a specific past moment, not just the latest backup. This is useful when someone accidentally drops a table or corrupts data.
+
+**Important constraint:** PITR can only recover changes that occurred AFTER the backup it restores from. If the data you want to recover was inserted before the backup was taken, PITR cannot retrieve it.
+
+```
+Timeline:
+  15:00 — Full backup taken
+  15:26 — Important table created, data inserted
+  15:30 — Table dropped accidentally
+  15:31 — You realize the mistake
+
+PITR target: --target="2026-03-11 15:29:00"
+Result: Restores from the 15:00 backup + replays WAL up to 15:29
+        → Table and data are recovered ✓
+
+If backup was taken at 15:27 instead of 15:00:
+PITR target: --target="2026-03-11 15:26:00"
+Result: Cannot recover — the backup was taken AFTER the data existed,
+        but BEFORE the target time. WAL from before the backup cannot be replayed.
+```
+
+**PITR restore command:**
+```bash
+# On the node to restore
+sudo systemctl stop patroni
+sudo bash -c "rm -rf /data/patroni/*"
+
+sudo -u postgres pgbackrest --stanza=postgres-cluster \
+  --type=time \
+  "--target=2026-03-11 15:29:00" \
+  --target-action=promote \
+  restore
+```
+
+`--target-action=promote` means: after replaying WAL up to the target time, promote this instance to a standalone primary so you can query the data.
+
+**After PITR — rejoin cluster:**
+
+PITR creates a standalone PostgreSQL, not a Patroni-managed replica. After verifying your data is recovered, rejoin the cluster:
+
+```bash
+# Stop standalone PostgreSQL
+sudo -u postgres /usr/pgsql-16/bin/pg_ctl stop -D /data/patroni
+
+# Clean data directory — Patroni will clone from current Leader
+sudo bash -c "rm -rf /data/patroni/*"
+
+# Start Patroni
+sudo systemctl start patroni
+sudo journalctl -u patroni -f
+```
+
+> ⚠️ **Timeline mismatch after PITR:** If the PITR restore diverges from the cluster's current timeline (e.g., cluster has progressed through multiple failovers since the backup), Patroni may fail to start with `requested timeline X is not a child of this server's history`. The fix is always: wipe the data directory and let Patroni re-clone from the Leader. Never try to manually reconcile timelines.
+
+### Quick Reference — pgBackRest Commands
+
+```bash
+# Backup
+sudo -u haproxy pgbackrest --stanza=postgres-cluster --type=full backup
+sudo -u haproxy pgbackrest --stanza=postgres-cluster --type=diff backup
+sudo -u haproxy pgbackrest --stanza=postgres-cluster --type=incr backup
+
+# Info
+sudo -u haproxy pgbackrest --stanza=postgres-cluster info
+sudo -u haproxy pgbackrest --stanza=postgres-cluster check
+
+# Restore (on db node)
+sudo -u postgres pgbackrest --stanza=postgres-cluster restore
+
+# PITR restore (on db node)
+sudo -u postgres pgbackrest --stanza=postgres-cluster \
+  --type=time "--target=YYYY-MM-DD HH:MM:SS" \
+  --target-action=promote restore
+
+# After PITR — rejoin cluster
+sudo -u postgres /usr/pgsql-16/bin/pg_ctl stop -D /data/patroni
+sudo bash -c "rm -rf /data/patroni/*"
+sudo systemctl start patroni
+```
+
+---
+
+*Guide prepared for: Rocky Linux 9 | PostgreSQL 16 | Patroni 4.x | etcd 3.5.x | HAProxy 2.8.x | pgBackRest 2.x*
