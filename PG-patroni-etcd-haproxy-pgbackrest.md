@@ -590,7 +590,7 @@ bootstrap:
 
   pg_hba:
     - host replication replicator 127.0.0.1/32 md5
-    - host replication replicator 172.16.93.136/24 md5
+    - host replication replicator 172.16.93.0/24 md5
     - host all all 0.0.0.0/0 md5
 
   users:
@@ -665,7 +665,7 @@ bootstrap:
 
   pg_hba:
     - host replication replicator 127.0.0.1/32 md5
-    - host replication replicator 172.16.93.136/24 md5
+    - host replication replicator 172.16.93.0/24 md5
     - host all all 0.0.0.0/0 md5
 
   users:
@@ -740,7 +740,7 @@ bootstrap:
 
   pg_hba:
     - host replication replicator 127.0.0.1/32 md5
-    - host replication replicator 172.16.93.136/24 md5
+    - host replication replicator 172.16.93.0/24 md5
     - host all all 0.0.0.0/0 md5
 
   users:
@@ -797,7 +797,7 @@ EOF
 | `max_wal_senders` | Maximum simultaneous WAL streaming connections. Each Replica uses one. Set to 10 for headroom. |
 | `wal_log_hints: on` | Required for `pg_rewind` to work correctly. |
 | `initdb.data-checksums` | Enables page-level data checksums. Detects silent data corruption on disk. |
-| `pg_hba` | PostgreSQL access control. Line 2 (`172.16.93.136/24`) allows all nodes in the subnet to replicate. Line 3 allows any host to connect with a password — restrict to application server IPs in production. |
+| `pg_hba` | PostgreSQL access control. Line 2 (`172.16.93.0/24`) allows all nodes in the subnet to replicate. Line 3 allows any host to connect with a password — restrict to application server IPs in production. |
 | `users.replicator` | Created during bootstrap with `replication` permission. Replicas authenticate as this user to stream WAL from the Primary. |
 | `postgresql.bin_dir` | Where Patroni finds PostgreSQL executables: `pg_ctl`, `initdb`, `pg_rewind`. |
 | `postgresql.pgpass` | Patroni writes passwords here for passwordless internal connections to PostgreSQL. |
@@ -1569,7 +1569,7 @@ ETCD_LISTEN_PEER_URLS="http://172.16.93.142:2380"
 ETCD_LISTEN_CLIENT_URLS="http://172.16.93.142:2379,http://127.0.0.1:2379"
 ETCD_INITIAL_ADVERTISE_PEER_URLS="http://172.16.93.142:2380"
 ETCD_ADVERTISE_CLIENT_URLS="http://172.16.93.142:2379"
-ETCD_INITIAL_CLUSTER="etcd1=http://172.16.93.136:2380,etcd2=http://172.16.93.137:2380,etcd3=http://172.16.93.138:2380,etcd4=http://172.16.93.142:2380"
+ETCD_INITIAL_CLUSTER="etcd1=http://172.16.93.136:2380,etcd3=http://172.16.93.138:2380,etcd4=http://172.16.93.142:2380"
 ETCD_INITIAL_CLUSTER_STATE="existing"
 ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster-1"
 ETCD_QUOTA_BACKEND_BYTES=8589934592
@@ -1578,7 +1578,28 @@ ETCD_AUTO_COMPACTION_RETENTION=1000
 EOF
 ```
 
-> Key difference from original setup: `ETCD_INITIAL_CLUSTER_STATE="existing"` instead of `"new"`, and all 4 nodes listed in `ETCD_INITIAL_CLUSTER`.
+> **Key differences from original setup:** `ETCD_INITIAL_CLUSTER_STATE="existing"` instead of `"new"`, and only currently active members are listed in `ETCD_INITIAL_CLUSTER` — pnode2 has been removed from the cluster so it is excluded here. Include only the nodes that are currently running and healthy.
+
+**On pnode4 — create systemd service file:**
+
+```bash
+sudo tee /etc/systemd/system/etcd.service <<EOF
+[Unit]
+Description=etcd key-value store
+After=network.target
+
+[Service]
+User=etcd
+EnvironmentFile=/etc/etcd/etcd.conf
+ExecStart=/usr/local/bin/etcd
+Restart=always
+RestartSec=5s
+LimitNOFILE=40000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
 
 **On pnode4 — start etcd:**
 ```bash
@@ -1587,9 +1608,9 @@ sudo systemctl enable etcd
 sudo systemctl start etcd
 ```
 
-**Verify — all 4 members started:**
+**Verify — all active members started:**
 ```bash
-etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.137:2379,http://172.16.93.138:2379,http://172.16.93.142:2379 \
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.138:2379,http://172.16.93.142:2379 \
   member list
 ```
 
@@ -1629,7 +1650,6 @@ restapi:
 etcd3:
   hosts:
     - 172.16.93.136:2379
-    - 172.16.93.137:2379
     - 172.16.93.138:2379
     - 172.16.93.142:2379
 
@@ -1690,6 +1710,35 @@ tags:
   nosync: false
 EOF
 ```
+
+> **Note:** `etcd3.hosts` lists only currently active members — pnode2 has been removed so it is excluded. The `bootstrap` section is carried over from other nodes but will not be used again — cluster settings are already stored in etcd. The `pg_hba` subnet `172.16.93.0/24` covers all nodes in this lab.
+
+**Create Patroni systemd service file:**
+
+```bash
+sudo tee /etc/systemd/system/patroni.service <<EOF
+[Unit]
+Description=Patroni PostgreSQL HA
+After=syslog.target network.target etcd.service
+Wants=etcd.service
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+ExecStart=/usr/local/bin/patroni /etc/patroni/patroni.yml
+ExecReload=/bin/kill -s HUP \$MAINPID
+KillMode=process
+TimeoutSec=30
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+**Start Patroni:**
 
 ```bash
 sudo systemctl daemon-reload
@@ -1848,7 +1897,7 @@ etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.138:2379,http://1
 
 The etcd config needs two changes:
 - `ETCD_INITIAL_CLUSTER_STATE` must be `"existing"` (not `"new"`)
-- `ETCD_INITIAL_CLUSTER` must list all current members
+- `ETCD_INITIAL_CLUSTER` must list all currently active members only
 
 ```bash
 sudo tee /etc/etcd/etcd.conf <<EOF
@@ -1869,6 +1918,26 @@ EOF
 
 > **Why `ETCD_INITIAL_CLUSTER_STATE="existing"`?** When state is `"new"`, etcd tries to bootstrap a fresh cluster — it will conflict with the running cluster. `"existing"` tells etcd this node is joining a cluster that already exists.
 
+> **Note:** The `etcd.service` systemd file already exists on pnode2 from the original setup — no need to recreate it. If for any reason it is missing (e.g., OS was reinstalled), create it:
+> ```bash
+> sudo tee /etc/systemd/system/etcd.service <<EOF
+> [Unit]
+> Description=etcd key-value store
+> After=network.target
+>
+> [Service]
+> User=etcd
+> EnvironmentFile=/etc/etcd/etcd.conf
+> ExecStart=/usr/local/bin/etcd
+> Restart=always
+> RestartSec=5s
+> LimitNOFILE=40000
+>
+> [Install]
+> WantedBy=multi-user.target
+> EOF
+> ```
+
 #### Step 4 — Clean Old etcd Data and Start
 
 The old etcd data directory must be cleared — it contains state from the previous cluster membership that is now stale.
@@ -1882,11 +1951,11 @@ sudo systemctl start etcd
 sudo journalctl -u etcd -f   # watch for "added member" and "synced" messages
 ```
 
-**Verify from any node:**
+**Verify from any node — all members should now show as "started":**
 ```bash
-etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.137:2379,http://172.16.93.138:2379,http://172.16.93.142:2379 \
+etcdctl --endpoints=http://172.16.93.136:2379,http://172.16.93.138:2379,http://172.16.93.142:2379 \
   member list
-# All members should show as "started"
+# pnode2/etcd2 should now show as "started" alongside the other members
 ```
 
 #### Step 5 — Clean PostgreSQL Data and Start Patroni
@@ -1968,6 +2037,13 @@ sudo dnf install -y epel-release
 sudo dnf install -y pgbackrest
 ```
 
+**After install on db nodes — create config directory if it does not exist:**
+```bash
+sudo mkdir -p /etc/pgbackrest
+sudo mkdir -p /var/log/pgbackrest
+sudo chown postgres:postgres /var/log/pgbackrest
+```
+
 **On haproxy node:**
 ```bash
 # pgBackRest is not in EPEL for haproxy (no PostgreSQL repo), install via PGDG repo
@@ -1976,45 +2052,89 @@ sudo dnf install -y epel-release libssh2
 sudo dnf install -y pgbackrest
 ```
 
-> ⚠️ **Common pitfall:** If pgBackRest was installed on haproxy BEFORE creating `/etc/pgbackrest/`, the config directory may not exist. Create it manually:
-> ```bash
-> sudo mkdir -p /etc/pgbackrest
-> ```
+**After install on haproxy node — create config and log directories:**
+```bash
+sudo mkdir -p /etc/pgbackrest
+sudo mkdir -p /var/log/pgbackrest
+sudo chown haproxy:haproxy /var/log/pgbackrest
+```
+
+> ⚠️ **Common pitfall:** pgBackRest install does not always create `/etc/pgbackrest/` automatically. Always create it manually after install on every node — the `mkdir -p` command is safe to run even if the directory already exists.
 
 ### Step 2 — SSH Key Exchange
 
 pgBackRest transfers files between nodes over SSH. The `postgres` user on db nodes must be able to SSH to haproxy as `haproxy` user, and vice versa.
 
-**On each db node (pnode1, pnode3, pnode4) — as postgres user:**
+**On each db node (pnode1, pnode3, pnode4) — first check postgres user's actual home directory:**
 ```bash
-# Generate SSH key for postgres user (if not already exists)
-sudo -u postgres ssh-keygen -t rsa -b 4096 -N "" -f /home/postgres/.ssh/id_rsa
+getent passwd postgres
+# Output example: postgres:x:26:26:PostgreSQL Server:/var/lib/pgsql:/bin/bash
+# The 6th field is the home directory — usually /var/lib/pgsql on Rocky Linux
+```
 
-# Copy public key to haproxy node
+**Create `.ssh` directory for postgres user (use the actual home directory from above):**
+```bash
+sudo mkdir -p /var/lib/pgsql/.ssh
+sudo chown postgres:postgres /var/lib/pgsql/.ssh
+sudo chmod 700 /var/lib/pgsql/.ssh
+```
+
+**Generate SSH key for postgres user:**
+```bash
+sudo -u postgres ssh-keygen -t rsa -b 4096 -N "" -f /var/lib/pgsql/.ssh/id_rsa
+```
+
+**Copy postgres public key to haproxy node:**
+```bash
 sudo -u postgres ssh-copy-id haproxy@172.16.93.139
 ```
 
-**On haproxy node — as haproxy user:**
+**On haproxy node — check haproxy user's actual home directory:**
 ```bash
-# Generate SSH key for haproxy user
-sudo -u haproxy ssh-keygen -t rsa -b 4096 -N "" -f /home/haproxy/.ssh/id_rsa
+getent passwd haproxy
+# Output example: haproxy:x:188:188:HAProxy Load Balancer:/var/lib/haproxy:/sbin/nologin
+# The 6th field is the home directory
+```
 
-# Copy public key to each db node
+**Create `.ssh` directory for haproxy user:**
+```bash
+sudo mkdir -p /var/lib/haproxy/.ssh
+sudo chown haproxy:haproxy /var/lib/haproxy/.ssh
+sudo chmod 700 /var/lib/haproxy/.ssh
+```
+
+**Generate SSH key for haproxy user:**
+```bash
+sudo -u haproxy ssh-keygen -t rsa -b 4096 -N "" -f /var/lib/haproxy/.ssh/id_rsa
+```
+
+**Copy haproxy public key to each db node:**
+```bash
 sudo -u haproxy ssh-copy-id postgres@172.16.93.136  # pnode1
 sudo -u haproxy ssh-copy-id postgres@172.16.93.138  # pnode3
 sudo -u haproxy ssh-copy-id postgres@172.16.93.142  # pnode4
 ```
 
-**Verify SSH works without password:**
+**Verify SSH works without password — from haproxy node:**
 ```bash
-# From haproxy node
-sudo -u haproxy ssh postgres@172.16.93.136 "echo SSH OK"
-sudo -u haproxy ssh postgres@172.16.93.138 "echo SSH OK"
-sudo -u haproxy ssh postgres@172.16.93.142 "echo SSH OK"
-
-# From pnode1
-sudo -u postgres ssh haproxy@172.16.93.139 "echo SSH OK"
+sudo -u haproxy ssh postgres@172.16.93.136 "echo SSH OK from haproxy to pnode1"
+sudo -u haproxy ssh postgres@172.16.93.138 "echo SSH OK from haproxy to pnode3"
+sudo -u haproxy ssh postgres@172.16.93.142 "echo SSH OK from haproxy to pnode4"
 ```
+
+**Verify SSH works without password — from each db node:**
+```bash
+# On pnode1
+sudo -u postgres ssh haproxy@172.16.93.139 "echo SSH OK from pnode1 to haproxy"
+
+# On pnode3
+sudo -u postgres ssh haproxy@172.16.93.139 "echo SSH OK from pnode3 to haproxy"
+
+# On pnode4
+sudo -u postgres ssh haproxy@172.16.93.139 "echo SSH OK from pnode4 to haproxy"
+```
+
+All six commands must return `SSH OK` before proceeding. If any fail, re-check the `.ssh` directory permissions and the `authorized_keys` file on the destination node.
 
 ### Step 3 — Create Repository Directory (haproxy node)
 
@@ -2078,7 +2198,9 @@ pg1-path=/data/patroni
 pg1-port=5432
 ```
 
-### Step 5 — Create Log Directories
+### Step 5 — Log Directories
+
+Log directories were already created in Step 1 as part of the post-install setup. This step is here for reference only — no action needed if Step 1 was followed.
 
 **On db nodes (pnode1, pnode3, pnode4):**
 ```bash
@@ -2216,13 +2338,20 @@ Timeline:
   15:31 — You realize the mistake
 
 PITR target: --target="2026-03-11 15:29:00"
-Result: Restores from the 15:00 backup + replays WAL up to 15:29
+Result: Restores from the 15:00 backup + replays WAL from 15:00 up to 15:29
         → Table and data are recovered ✓
 
-If backup was taken at 15:27 instead of 15:00:
+Scenario where recovery FAILS:
+  15:26 — Important table created, data inserted
+  15:27 — Full backup taken   ← backup happens AFTER the data was created
+  15:30 — Table dropped accidentally
+
 PITR target: --target="2026-03-11 15:26:00"
-Result: Cannot recover — the backup was taken AFTER the data existed,
-        but BEFORE the target time. WAL from before the backup cannot be replayed.
+Result: Cannot recover — pgBackRest will restore from the 15:27 backup
+        (the only available backup), but 15:26 is BEFORE that backup.
+        You cannot go back in time before the earliest available backup.
+        The WAL archive only covers changes AFTER the backup was taken —
+        there is no WAL for events that occurred before the backup.
 ```
 
 **PITR restore command:**
