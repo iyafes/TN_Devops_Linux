@@ -14449,3 +14449,512 @@ $$;
 SELECT set_tenant(42);
 SELECT * FROM orders;  -- tenant 42 only
 ```
+
+
+---
+
+# 24. pgvector — Vector Embeddings এবং AI/ML Search
+
+## 24.1 pgvector কী এবং কেন
+
+```
+pgvector:
+  PostgreSQL এ vector (floating point array) store এবং search করো
+  AI/ML applications এর জন্য — semantic search, recommendation
+
+Use cases:
+  ① Semantic search: "laptop" query → "notebook computer" result
+  ② Image similarity: similar images খোঁজো
+  ③ Recommendation: "user A এর মতো users কী পছন্দ করে?"
+  ④ RAG (Retrieval Augmented Generation): LLM এ context দাও
+  ⑤ Anomaly detection: outlier vectors খোঁজো
+
+Traditional vs Vector search:
+  Traditional (LIKE, FTS): exact/keyword match
+  Vector search: semantic/meaning based match
+  
+  "What is PostgreSQL?" → embedding → [0.12, -0.45, 0.78, ...]
+  Query: "Tell me about relational databases"
+             → embedding → [0.15, -0.41, 0.72, ...]
+  → Similar vectors → relevant results!
+```
+
+---
+
+## 24.2 pgvector Install এবং Setup
+
+```bash
+# Rocky Linux 9 এ install করো
+sudo dnf install -y pgvector_16
+# অথবা source থেকে:
+# git clone https://github.com/pgvector/pgvector
+# make && make install
+```
+
+```sql
+-- Extension enable করো
+CREATE EXTENSION vector;
+
+-- Version দেখো
+SELECT extversion FROM pg_extension WHERE extname = 'vector';
+```
+
+---
+
+## 24.3 Vector Data তৈরি করো
+
+```sql
+-- ─── Table তৈরি করো ───
+CREATE TABLE documents (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title       TEXT NOT NULL,
+    content     TEXT,
+    embedding   VECTOR(1536),  -- OpenAI ada-002 = 1536 dimensions
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Smaller example (3 dimensions — concept বোঝার জন্য)
+CREATE TABLE items (
+    id        INTEGER PRIMARY KEY,
+    name      TEXT,
+    embedding VECTOR(3)
+);
+
+INSERT INTO items VALUES
+    (1, 'laptop',    '[1.0, 0.5, 0.2]'),
+    (2, 'notebook',  '[0.9, 0.6, 0.1]'),  -- laptop এর মতো
+    (3, 'phone',     '[0.1, 0.9, 0.8]'),
+    (4, 'tablet',    '[0.3, 0.8, 0.7]'),  -- phone এর মতো
+    (5, 'desk',      '[0.2, 0.1, 0.9]');  -- সবার থেকে আলাদা
+
+-- ─── Similarity Search ───
+
+-- L2 Distance (Euclidean — small = similar)
+SELECT name,
+    embedding <-> '[1.0, 0.5, 0.2]' AS l2_distance
+FROM items
+ORDER BY embedding <-> '[1.0, 0.5, 0.2]'
+LIMIT 3;
+-- laptop (0.0), notebook (0.14), tablet (0.85)
+
+-- Cosine Similarity (1 = identical, 0 = orthogonal)
+SELECT name,
+    1 - (embedding <=> '[1.0, 0.5, 0.2]') AS cosine_similarity
+FROM items
+ORDER BY embedding <=> '[1.0, 0.5, 0.2]'
+LIMIT 3;
+
+-- Inner Product (higher = more similar for normalized vectors)
+SELECT name,
+    (embedding <#> '[1.0, 0.5, 0.2]') * -1 AS inner_product
+FROM items
+ORDER BY embedding <#> '[1.0, 0.5, 0.2]'
+LIMIT 3;
+
+-- Distance operators:
+-- <->  L2 distance (most common)
+-- <=>  Cosine distance
+-- <#>  Inner product (negative, so ORDER BY ASC)
+-- <+>  L1 distance (Manhattan) — PG 0.7.0+
+```
+
+---
+
+## 24.4 Indexes — Fast Vector Search
+
+```sql
+-- ─── HNSW Index (Hierarchical Navigable Small World) ───
+-- Fastest queries, more memory, best for production
+CREATE INDEX idx_items_hnsw ON items
+    USING hnsw (embedding vector_l2_ops)
+    WITH (m = 16, ef_construction = 64);
+-- m = max connections per layer (higher = better recall, more memory)
+-- ef_construction = search depth during build (higher = better quality)
+
+-- Cosine distance এর জন্য:
+CREATE INDEX idx_docs_hnsw_cosine ON documents
+    USING hnsw (embedding vector_cosine_ops);
+
+-- ─── IVFFlat Index (Inverted File) ───
+-- Less memory, good for large datasets, needs tuning
+CREATE INDEX idx_items_ivfflat ON items
+    USING ivfflat (embedding vector_l2_ops)
+    WITH (lists = 100);
+-- lists = number of clusters
+-- Rule: sqrt(row_count) for lists
+-- 1M rows → lists = 1000
+
+-- IVFFlat কাজ করতে data আগে থাকতে হবে
+-- Empty table তে index তৈরি করলে quality খারাপ
+
+-- ─── Index tuning ───
+-- Query এ কতটা cluster search করবে
+SET ivfflat.probes = 10;     -- Higher = better recall, slower
+SET hnsw.ef_search = 40;     -- Higher = better recall, slower
+
+-- ─── EXPLAIN দেখো ───
+EXPLAIN SELECT name, embedding <-> '[1,2,3]' AS dist
+FROM items ORDER BY embedding <-> '[1,2,3]' LIMIT 5;
+-- Index Scan using idx_items_hnsw দেখাবে ✅
+-- Seq Scan দেখালে index use হচ্ছে না (threshold check করো)
+```
+
+---
+
+## 24.5 Real-world Example — Document Search
+
+```sql
+-- ─── Full RAG (Retrieval Augmented Generation) setup ───
+
+CREATE TABLE knowledge_base (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    source      TEXT,                    -- document source
+    chunk_text  TEXT NOT NULL,           -- text chunk
+    embedding   VECTOR(1536) NOT NULL,   -- OpenAI embedding
+    metadata    JSONB,                   -- extra info
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_kb_hnsw ON knowledge_base
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- ─── Function: Similar documents খোঁজো ───
+CREATE OR REPLACE FUNCTION search_documents(
+    query_embedding VECTOR(1536),
+    match_threshold FLOAT DEFAULT 0.8,
+    match_count     INTEGER DEFAULT 5
+)
+RETURNS TABLE (
+    id          BIGINT,
+    chunk_text  TEXT,
+    similarity  FLOAT,
+    metadata    JSONB
+)
+LANGUAGE sql STABLE AS $$
+    SELECT
+        id,
+        chunk_text,
+        1 - (embedding <=> query_embedding) AS similarity,
+        metadata
+    FROM knowledge_base
+    WHERE 1 - (embedding <=> query_embedding) > match_threshold
+    ORDER BY embedding <=> query_embedding
+    LIMIT match_count;
+$$;
+
+-- ─── Use করো (Python application এ) ───
+/*
+import openai
+import psycopg2
+
+def search(query: str, n: int = 5):
+    # Query embedding তৈরি করো
+    response = openai.embeddings.create(
+        model="text-embedding-ada-002",
+        input=query
+    )
+    embedding = response.data[0].embedding
+
+    # PostgreSQL এ search করো
+    with psycopg2.connect(...) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM search_documents(%s, %s, %s)",
+                (embedding, 0.7, n)
+            )
+            return cur.fetchall()
+
+results = search("How to optimize PostgreSQL queries?")
+*/
+
+-- ─── Hybrid Search (vector + full-text) ───
+-- Vector similarity + keyword match একসাথে
+SELECT
+    id,
+    chunk_text,
+    1 - (embedding <=> query_vec) AS vec_score,
+    ts_rank(to_tsvector('english', chunk_text),
+            to_tsquery('english', 'postgresql')) AS text_score,
+    -- Combine scores
+    (1 - (embedding <=> query_vec)) * 0.7 +
+    ts_rank(to_tsvector('english', chunk_text),
+            to_tsquery('english', 'postgresql')) * 0.3 AS combined_score
+FROM knowledge_base,
+    (SELECT '[0.12, -0.45, ...]'::VECTOR(1536) AS query_vec) q
+WHERE to_tsvector('english', chunk_text) @@ to_tsquery('english', 'postgresql')
+ORDER BY combined_score DESC
+LIMIT 10;
+```
+
+---
+
+## 24.6 pgvector Performance Tuning
+
+```sql
+-- ─── Maintenance ───
+-- HNSW index এর জন্য
+SET maintenance_work_mem = '1GB';  -- Build time memory
+
+-- Index build parallel করো
+SET max_parallel_maintenance_workers = 4;
+
+-- ─── Monitoring ───
+-- Index size দেখো
+SELECT pg_size_pretty(pg_relation_size('idx_kb_hnsw'));
+
+-- Index usage দেখো
+SELECT idx_scan, idx_tup_read FROM pg_stat_user_indexes
+WHERE indexrelname = 'idx_kb_hnsw';
+
+-- ─── Quantization (memory কমাও — PG 0.7.0+) ───
+-- Half-precision (float4 → float2): 50% memory, slight accuracy loss
+CREATE INDEX idx_kb_hnsw_half ON knowledge_base
+    USING hnsw (embedding::halfvec(1536) halfvec_cosine_ops);
+
+-- Binary quantization: 32x smaller, only for high-dim vectors
+CREATE INDEX idx_kb_hnsw_bit ON knowledge_base
+    USING hnsw ((binary_quantize(embedding)::bit(1536)) bit_hamming_ops);
+```
+
+---
+
+# 25. Generated Columns এবং Advanced Materialized Views
+
+## 25.1 Generated Columns — Auto-computed Values
+
+```sql
+-- ─── STORED Generated Column (data physically stored) ───
+CREATE TABLE products (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name        TEXT NOT NULL,
+    price       NUMERIC(10,2) NOT NULL,
+    tax_rate    NUMERIC(4,2) NOT NULL DEFAULT 0.15,  -- 15% tax
+    -- Generated column: price + tax automatically computed
+    price_with_tax NUMERIC(10,2)
+        GENERATED ALWAYS AS (price * (1 + tax_rate)) STORED,
+    -- Full text search vector (always up to date)
+    search_vector TSVECTOR
+        GENERATED ALWAYS AS (to_tsvector('english', name)) STORED
+);
+
+-- Insert করো (generated columns এ লিখতে পারবে না)
+INSERT INTO products (name, price, tax_rate)
+VALUES ('Laptop', 999.99, 0.15);
+
+SELECT name, price, tax_rate, price_with_tax FROM products;
+-- price_with_tax = 1149.99 (automatically calculated)
+
+-- Update করলে auto-recalculate হয়
+UPDATE products SET price = 899.99 WHERE id = 1;
+SELECT price_with_tax FROM products WHERE id = 1;
+-- 1034.99 (automatically updated!)
+
+-- ─── Index on generated column ───
+CREATE INDEX idx_price_with_tax ON products(price_with_tax);
+CREATE INDEX idx_search ON products USING GIN(search_vector);
+
+-- FTS search now fast!
+SELECT name FROM products WHERE search_vector @@ to_tsquery('laptop');
+
+-- ─── Practical examples ───
+-- Full name (first + last)
+CREATE TABLE persons (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    first_name TEXT,
+    last_name  TEXT,
+    full_name  TEXT GENERATED ALWAYS AS
+                   (first_name || ' ' || last_name) STORED
+);
+
+-- Age calculation
+CREATE TABLE members (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    birth_date  DATE,
+    -- Note: STORED means snapshot at insert/update, NOT dynamic
+    -- For truly dynamic age, use a VIEW or function instead
+    birth_year  INTEGER GENERATED ALWAYS AS
+                    (EXTRACT(YEAR FROM birth_date)::INTEGER) STORED
+);
+
+-- ─── Generated column এর limitations ───
+-- ✅ Can reference other columns in same table
+-- ✅ Can use immutable functions
+-- ✅ Can be indexed
+-- ❌ Cannot reference other tables
+-- ❌ Cannot use volatile functions (NOW(), random())
+-- ❌ Cannot be updated manually
+-- ❌ Cannot use subqueries
+```
+
+---
+
+## 25.2 Materialized Views — Advanced Patterns
+
+```sql
+-- ─── Basic Materialized View ───
+CREATE MATERIALIZED VIEW daily_revenue AS
+SELECT
+    DATE_TRUNC('day', created_at) AS day,
+    COUNT(*) AS order_count,
+    SUM(total) AS revenue,
+    AVG(total) AS avg_order
+FROM orders
+WHERE status = 'completed'
+GROUP BY 1
+ORDER BY 1;
+
+-- Index যোগ করো (query fast করতে)
+CREATE UNIQUE INDEX idx_daily_rev_day ON daily_revenue(day);
+CREATE INDEX idx_daily_rev_revenue ON daily_revenue(revenue DESC);
+
+-- Manual refresh
+REFRESH MATERIALIZED VIEW daily_revenue;
+
+-- ─── CONCURRENTLY Refresh (no lock) ───
+-- Requires UNIQUE index
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;
+-- Existing data সরিয়ে না → queries চলতে থাকে
+-- Slower কিন্তু zero downtime
+
+-- ─── pg_cron দিয়ে automatic refresh ───
+SELECT cron.schedule(
+    'refresh-daily-revenue',
+    '5 0 * * *',  -- Every day at 00:05 UTC
+    'REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue'
+);
+
+-- ─── Incremental-like refresh (manual) ───
+-- Full refresh expensive হলে:
+CREATE MATERIALIZED VIEW recent_revenue AS
+SELECT
+    DATE_TRUNC('day', created_at) AS day,
+    COUNT(*) AS order_count,
+    SUM(total) AS revenue
+FROM orders
+WHERE status = 'completed'
+  AND created_at > NOW() - INTERVAL '90 days'  -- Only recent data
+GROUP BY 1;
+-- Faster refresh কারণ কম data scan করে
+
+-- ─── Layered Materialized Views ───
+-- Summary on top of summary
+CREATE MATERIALIZED VIEW monthly_revenue AS
+SELECT
+    DATE_TRUNC('month', day) AS month,
+    SUM(order_count) AS total_orders,
+    SUM(revenue) AS total_revenue
+FROM daily_revenue  -- ← দৈনিক মতো এর উপর aggregate
+GROUP BY 1;
+
+-- Refresh order: daily আগে, monthly পরে
+REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;
+REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_revenue;
+
+-- ─── Materialized View তে dependency track করো ───
+SELECT
+    dependent.relname AS matview,
+    source.relname AS depends_on
+FROM pg_depend d
+JOIN pg_class dependent ON d.objid = dependent.oid
+JOIN pg_class source ON d.refobjid = source.oid
+WHERE dependent.relkind = 'm';
+
+-- ─── Staleness check করো ───
+-- Last refresh কখন হয়েছে?
+SELECT schemaname, matviewname, ispopulated,
+    pg_size_pretty(pg_relation_size(schemaname||'.'||matviewname)) AS size
+FROM pg_matviews
+WHERE schemaname = 'public';
+-- ispopulated = true → data আছে
+
+-- ─── View vs Materialized View ───
+-- Regular VIEW: query time এ calculate, সবসময় fresh
+-- Materialized VIEW: pre-calculated, manual/scheduled refresh
+-- Use MV when: query >1s, data freshness = minutes/hours ok
+-- Use View when: always fresh data চাই, simple query
+```
+
+---
+
+## 25.3 Advanced Partitioning Patterns
+
+```sql
+-- ─── Sub-partitioning ───
+CREATE TABLE events (
+    id          BIGINT,
+    tenant_id   INTEGER,
+    event_type  TEXT,
+    created_at  TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);  -- First level: time
+
+-- Year partitions
+CREATE TABLE events_2024
+    PARTITION OF events
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')
+    PARTITION BY LIST (tenant_id);  -- Second level: tenant
+
+-- Tenant sub-partitions
+CREATE TABLE events_2024_t1
+    PARTITION OF events_2024
+    FOR VALUES IN (1);
+
+CREATE TABLE events_2024_t2
+    PARTITION OF events_2024
+    FOR VALUES IN (2);
+
+-- Default partition (uncategorized)
+CREATE TABLE events_2024_default
+    PARTITION OF events_2024
+    DEFAULT;
+
+-- ─── Partition Pruning Verify করো ───
+-- Planner এ partition exclusion হচ্ছে কিনা:
+EXPLAIN SELECT * FROM events WHERE created_at = '2024-03-08';
+-- "Partitions selected: 1 of 5" দেখাবে → pruning কাজ করছে ✅
+
+-- ─── Partition-wise operations ───
+-- postgresql.conf / session:
+SET enable_partitionwise_join = on;
+SET enable_partitionwise_aggregate = on;
+
+EXPLAIN SELECT tenant_id, COUNT(*)
+FROM events
+GROUP BY tenant_id;
+-- "Partial HashAggregate" per partition → parallel এ চলবে
+
+-- ─── Online Partition management ───
+-- New partition যোগ করো
+CREATE TABLE events_2025
+    PARTITION OF events
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+-- Old partition detach করো (data রেখে)
+ALTER TABLE events DETACH PARTITION events_2022;
+-- events_2022 এখন standalone table, events এ আর নেই
+
+-- Archive করো এবং delete করো
+-- events_2022 → S3 export → drop করো
+COPY events_2022 TO '/tmp/events_2022_archive.csv' CSV HEADER;
+DROP TABLE events_2022;
+
+-- ─── pg_partman দিয়ে automatic management ───
+SELECT partman.create_parent(
+    p_parent_table  => 'public.events',
+    p_control       => 'created_at',
+    p_type          => 'range',
+    p_interval      => 'monthly',
+    p_premake       => 3,    -- 3 future partitions আগে তৈরি করো
+    p_start_partition => '2024-01-01'
+);
+
+-- Maintenance (pg_cron দিয়ে)
+SELECT cron.schedule('partman-run', '0 * * * *',
+    'SELECT partman.run_maintenance()');
+
+-- Retention (6 months পুরনো delete করো)
+UPDATE partman.part_config
+SET retention = '6 months',
+    retention_keep_table = false
+WHERE parent_table = 'public.events';
+```
