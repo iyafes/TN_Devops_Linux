@@ -1,4 +1,4 @@
-# Topic 4 — WAL Archiving and Point-in-Time Recovery (PITR)
+# WAL Archiving and Point-in-Time Recovery (PITR)
 
 ## Concepts First
 
